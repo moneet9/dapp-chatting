@@ -1,0 +1,19 @@
+{
+  "users": [
+    {
+      "id": "0x8ea9f7f06d0d5389a6f23775fa2cb33dc1aee301",
+      "address": "0x8ea9f7f06d0d5389a6f23775fa2cb33dc1aee301",
+      "username": "User-8ea9f7",
+      "status": "offline",
+      "lastSeen": 1772360895471
+    }
+  ],
+  "chats": [],
+  "messages": {},
+  "nonces": {
+    "0x8ea9f7f06d0d5389a6f23775fa2cb33dc1aee301": {
+      "nonce": "b3ff971132794d9a",
+      "expiresAt": 1772362860564
+    }
+  }
+}

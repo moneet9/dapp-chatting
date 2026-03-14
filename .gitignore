@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment files
+.env
+**/.env
+**/.env.local
+**/.env.development
+**/.env.production
+
+# Keep sample env files
+!.env.example
+!**/.env.example
+!**/.env.example.env
+
+# Logs and misc
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+
+# Build output
+dist/
+coverage/
+frontend/dist/
+
+# Hardhat generated build artifacts
+contracts/cache/
+contracts/artifacts/
+
+# Local backup of nested git metadata
+contracts/.git.backup/
