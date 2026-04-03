@@ -1,0 +1,123 @@
+Optimizing tool selection...Here is a viva-ready explanation you can use for this project.
+
+**What blockchain is used for in this app**
+Blockchain is used only as an identity registry. In ChatRegistry.sol, a user connects MetaMask and publishes:
+1. A username
+2. A Secret ID
+
+Other users can then resolve that Secret ID to find the wallet address of the person they want to chat with. So blockchain helps with identity verification and contact discovery, not with message storage.
+
+**How the app works, in simple flow**
+1. The user opens the frontend in App.jsx.
+2. The user connects MetaMask.
+3. The frontend asks the backend for a nonce.
+4. The user signs that nonce with their wallet.
+5. The backend verifies the signature and issues a JWT.
+6. The frontend loads chats, contacts, and profile data from the backend.
+7. The frontend connects to Socket.IO for realtime events.
+8. When a user adds a contact, the app uses the blockchain registry to resolve the contact’s Secret ID to a wallet address.
+9. When a user sends a message, it is encrypted in the browser using secureChat.js.
+10. The backend stores only the encrypted message in MongoDB and broadcasts it through Socket.IO.
+
+**Very important viva answer**
+Messages are not saved on blockchain. Messages are saved in MongoDB on the backend, and the content is encrypted before storage and before sending. The backend does not see plaintext message content.
+
+**Hard viva questions and answers**
+
+1. What is the main purpose of blockchain in your project?  
+Blockchain is used for decentralized identity lookup. It stores username and Secret ID mapping so users can find each other by Secret ID.
+
+2. Does blockchain store chat messages?  
+No. Chat messages are stored in MongoDB, not on-chain.
+
+3. Why did you not store messages on blockchain?  
+Because blockchain storage is expensive, slow, and publicly visible. Chat data needs fast realtime handling and privacy, so MongoDB plus encryption is a better fit.
+
+4. What data is actually stored on blockchain?  
+The user’s username and hashed Secret ID in ChatRegistry.sol.
+
+5. Why do you need MetaMask?  
+MetaMask is used for wallet connection, signature-based login, and writing identity data to the contract.
+
+6. How does login work?  
+The backend gives a nonce, the user signs it with MetaMask, and the backend verifies the signature before issuing a JWT.
+
+7. Why use nonce-based login?  
+To prove wallet ownership without using a password. The nonce prevents replay attacks.
+
+8. Is the app fully decentralized?  
+No. It is hybrid. Identity lookup uses blockchain, but chat storage and realtime delivery use backend services.
+
+9. Where are chats stored?  
+Chats are stored in MongoDB through the backend store layer in store.js.
+
+10. Where are messages stored?  
+Messages are stored in MongoDB in encrypted form.
+
+11. Are messages encrypted?  
+Yes. The frontend encrypts message text before sending it using AES-GCM in secureChat.js.
+
+12. Who decrypts the message?  
+The browser decrypts it locally on the client side after loading it from the backend.
+
+13. Can the backend read the message content?  
+No. It only sees encrypted payloads.
+
+14. Is this end-to-end encryption?  
+It is client-side encrypted messaging. The backend does not receive plaintext, so it behaves like end-to-end encrypted delivery for the stored chat content.
+
+15. What is the role of the Secret ID?  
+The Secret ID is used as part of the key material for encryption and as a blockchain-based lookup identifier.
+
+16. Why do you need Secret IDs if you already have wallet addresses?  
+Secret IDs make contact discovery easier and provide an extra identity layer for resolving contacts through the contract.
+
+17. What happens when a user adds a contact?  
+The frontend sends the Secret ID to the contract, resolves it to an address, fetches the chain username, and then adds that user as a contact in the backend.
+
+18. Why store contacts in the backend if blockchain already has identities?  
+Because contact lists, chat ordering, and UI state need fast query support and private user-specific data handling.
+
+19. What does Socket.IO do here?  
+It provides realtime message delivery, online/offline status, and typing indicators.
+
+20. What is the role of MongoDB?  
+MongoDB stores users, chats, messages, contacts, and nonces.
+
+21. What is stored in the JWT token?  
+User ID, wallet address, and username.
+
+22. Why use JWT after wallet login?  
+So the user does not need to sign every API request. It maintains authenticated sessions for backend requests.
+
+23. What happens when you send a message?  
+The client encrypts the text, sends ciphertext to the backend, the backend stores it, and Socket.IO broadcasts it to the chat room.
+
+24. How do you know which chat a message belongs to?  
+Each message includes a chatId, and the backend checks that the sender is a participant before saving it.
+
+25. Can any user read any message from the database?  
+No. The backend checks chat membership before returning messages.
+
+26. What happens if the user opens a chat on another device?  
+If that device does not have the matching Secret ID stored locally, the chat may be locked and the messages cannot be decrypted there.
+
+27. Where is the blockchain contract code?  
+In ChatRegistry.sol.
+
+28. Where is the frontend blockchain interaction?  
+In App.jsx and chatRegistryAbi.js.
+
+29. What is the contract’s main function?  
+It registers and resolves user identity information.
+
+30. Why is the contract simple?  
+Because the project uses blockchain only for identity lookup, not for full chat infrastructure.
+
+**Short viva summary you can memorize**
+“This project is a hybrid Web3 chat app. Blockchain is used only for identity registration and contact lookup through wallet-based Secret IDs. Messages are not stored on-chain. They are encrypted in the browser, sent to the backend, and stored in MongoDB in encrypted form. MetaMask handles login and blockchain writes, while Socket.IO provides realtime chat.”
+
+If you want, I can next turn this into:
+1. a 1-minute viva answer sheet,
+2. a professor-style question bank with difficult follow-up questions,
+3. or a mock viva with questions and model answers.
