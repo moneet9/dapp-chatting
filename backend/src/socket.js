@@ -2,6 +2,12 @@ import { Server } from 'socket.io';
 import { verifySocketToken } from './auth.js';
 import { getChat, saveMessage, setUserStatus } from './store.js';
 
+let socketServer = null;
+
+export function getSocketServer() {
+  return socketServer;
+}
+
 function withSocketError(socket, handler) {
   return (...args) => {
     Promise.resolve(handler(...args)).catch((error) => {
@@ -31,6 +37,8 @@ export function createSocketServer(httpServer, corsOrigin) {
       credentials: true,
     },
   });
+
+  socketServer = io;
 
   io.use((socket, next) => {
     const token = socket.handshake.auth?.token;

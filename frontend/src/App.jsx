@@ -7,8 +7,14 @@ import {
   encryptTextForChat,
   getOrCreateSelfSecretId,
   getContactSecretStorageKey,
+  hideContact,
+  isHiddenContact,
   getStoredContactSecretId,
   storeContactSecretId,
+  deriveSecretIdFromWalletAddress,
+  deriveWalletAddressFromSecretId,
+  resolveContactAddressFromInput,
+  unhideContact,
 } from './secureChat.js';
 import './App.css';
 
@@ -73,7 +79,7 @@ function normalizeChats(chatItems) {
   return normalized;
 }
 
-function mergeContactsWithChats(contactItems, chatItems, userItems, currentUserId) {
+function mergeContactsWithChats(contactItems, chatItems, userItems, currentUserId, walletAddress) {
   const contactsById = new Map();
 
   for (const contact of Array.isArray(contactItems) ? contactItems : []) {
@@ -88,7 +94,7 @@ function mergeContactsWithChats(contactItems, chatItems, userItems, currentUserI
     if (chat.type !== 'direct' || !Array.isArray(chat.participants) || !currentUserId) continue;
 
     const peerId = chat.participants.find((participantId) => participantId !== currentUserId);
-    if (!peerId || contactsById.has(peerId)) continue;
+    if (!peerId || contactsById.has(peerId) || isHiddenContact(walletAddress, peerId)) continue;
 
     const peerUser = usersById.get(peerId);
     if (!peerUser) continue;
@@ -104,10 +110,15 @@ function upsertContactFromMessage(message, walletAddress, currentUserId) {
     return null;
   }
 
+  if (isHiddenContact(walletAddress, message.senderId)) {
+    return null;
+  }
+
   return {
     id: message.senderId,
     username: message.senderUsername || fallbackName(message.senderId, 'Contact'),
-    secretKey: message.senderSecretKey || '',
+    address: message.senderAddress || '',
+    secretKey: deriveSecretIdFromWalletAddress(message.senderAddress),
   };
 }
 
@@ -184,8 +195,14 @@ function App() {
     return map;
   }, [chats, currentUser?.id]);
 
+  const walletAddress = address || currentUser?.address;
+
+  const visibleContacts = useMemo(() => {
+    return contacts.filter((contact) => !isHiddenContact(walletAddress, contact.id));
+  }, [contacts, walletAddress]);
+
   const contactsForUi = useMemo(() => {
-    return [...contacts].sort((a, b) => {
+    return [...visibleContacts].sort((a, b) => {
       const chatA = directChatByContactId.get(a.id);
       const chatB = directChatByContactId.get(b.id);
       const timeA = chatA?.lastMessageTime || 0;
@@ -193,7 +210,9 @@ function App() {
       if (timeA !== timeB) return timeB - timeA;
       return (a.username || '').localeCompare(b.username || '');
     });
-  }, [contacts, directChatByContactId]);
+  }, [visibleContacts, directChatByContactId]);
+
+  const activeContact = visibleContacts.find((contact) => contact.id === activeContactId) || null;
 
   useEffect(() => {
     if (!token) return;
@@ -209,8 +228,8 @@ function App() {
     const walletAddress = address || currentUser?.address;
     if (!walletAddress) return;
 
-    setProfileSecretId(currentUser?.secretKey || getOrCreateSelfSecretId(walletAddress));
-  }, [token, address, currentUser?.address, currentUser?.secretKey]);
+    setProfileSecretId(getOrCreateSelfSecretId(walletAddress));
+  }, [token, address, currentUser?.address]);
 
   const connectWallet = async () => {
     if (!window.ethereum) {
@@ -262,7 +281,7 @@ function App() {
         setToken(nextToken);
         setCurrentUser(loginPayload.data?.user || decodeToken(nextToken));
         setAddress(loginPayload.data?.user?.address || userAddress);
-        setProfileSecretId(loginPayload.data?.user?.secretKey || getOrCreateSelfSecretId(userAddress));
+        setProfileSecretId(getOrCreateSelfSecretId(userAddress));
       } catch (connectionError) {
         console.error('Connection failed:', connectionError);
 
@@ -309,7 +328,7 @@ function App() {
     if (!token) return;
     let cancelled = false;
 
-    (async () => {
+    const refreshChatData = async () => {
       try {
         const [mePayload, contactsPayload, chatsPayload, usersPayload] = await Promise.all([
           apiRequest('/api/me', { token }),
@@ -324,11 +343,12 @@ function App() {
         const contactItems = Array.isArray(contactsPayload.data) ? contactsPayload.data : [];
         const chatItems = normalizeChats(chatsPayload.data?.items || []);
         const userItems = Array.isArray(usersPayload.data) ? usersPayload.data : [];
+        const nextWalletAddress = me?.address || address || currentUser?.address;
 
         setCurrentUser(me);
         setAddress(me?.address || null);
         setProfileUsername(me?.username || '');
-        setContacts(mergeContactsWithChats(contactItems, chatItems, userItems, me?.id));
+        setContacts(mergeContactsWithChats(contactItems, chatItems, userItems, me?.id, nextWalletAddress));
         setChats(chatItems);
 
         if (activeContactId) {
@@ -343,10 +363,14 @@ function App() {
           setError(fetchError.message || 'Failed to load chat data.');
         }
       }
-    })();
+    };
+
+    refreshChatData();
+    const refreshTimer = window.setInterval(refreshChatData, 10000);
 
     return () => {
       cancelled = true;
+      window.clearInterval(refreshTimer);
     };
   }, [token, activeContactId]);
 
@@ -355,8 +379,8 @@ function App() {
     if (!walletAddress || !Array.isArray(contacts) || contacts.length === 0) return;
 
     for (const contact of contacts) {
-      if (contact?.id && contact?.secretKey) {
-        storeContactSecretId(walletAddress, contact.id, contact.secretKey);
+      if (contact?.id && contact?.address) {
+        storeContactSecretId(walletAddress, contact.id, getOrCreateSelfSecretId(contact.address));
       }
     }
   }, [contacts, address, currentUser?.address]);
@@ -367,9 +391,13 @@ function App() {
 
     for (const message of rawMessages) {
       const contact = upsertContactFromMessage(message, walletAddress, currentUser.id);
-      if (!contact?.secretKey) continue;
+      if (!contact) {
+        continue;
+      }
 
-      storeContactSecretId(walletAddress, contact.id, contact.secretKey);
+      if (contact?.secretKey) {
+        storeContactSecretId(walletAddress, contact.id, contact.secretKey);
+      }
       setContacts((prev) => {
         const existingIndex = prev.findIndex((item) => item.id === contact.id);
         if (existingIndex === -1) {
@@ -420,6 +448,7 @@ function App() {
     newSocket.on('message:new', (message) => {
       const walletAddress = address || currentUser?.address;
       const incomingContact = upsertContactFromMessage(message, walletAddress, currentUser?.id);
+      const shouldAutoOpenChat = !activeChatIdRef.current && message.senderId && currentUser?.id && message.senderId !== currentUser.id;
 
       if (incomingContact?.secretKey && walletAddress) {
         storeContactSecretId(walletAddress, incomingContact.id, incomingContact.secretKey);
@@ -435,6 +464,23 @@ function App() {
             ...incomingContact,
           };
           return nextContacts;
+        });
+      }
+
+      if (shouldAutoOpenChat) {
+        setActiveContactId(message.senderId);
+        setActiveChat((prev) => {
+          if (prev?.id === message.chatId) return prev;
+
+          return {
+            id: message.chatId,
+            type: 'direct',
+            participants: [currentUser.id, message.senderId],
+            lastMessage: message,
+            lastMessageTime: message.timestamp,
+            unreadCount: 0,
+            createdAt: message.timestamp,
+          };
         });
       }
 
@@ -517,7 +563,9 @@ function App() {
       return;
     }
 
-    const contactSecretId = getStoredContactSecretId(walletAddress, activeContactId);
+    const contactSecretId =
+      getStoredContactSecretId(walletAddress, activeContactId) ||
+      deriveSecretIdFromWalletAddress(activeContact?.address);
     setActiveContactSecretId(contactSecretId);
 
     if (!profileSecretId || !contactSecretId) {
@@ -564,7 +612,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [rawMessages, activeContactId, profileSecretId, address, currentUser?.address]);
+  }, [rawMessages, activeContactId, profileSecretId, address, currentUser?.address, activeContact?.address]);
 
   const openDirectChat = async (contactId) => {
     if (!token || !currentUser?.id || contactId === currentUser.id) return;
@@ -631,10 +679,10 @@ function App() {
       if (nextUser) {
         setCurrentUser(nextUser);
         setProfileUsername(nextUser.username || username);
-        setProfileSecretId(nextUser.secretKey || profileSecretId || '');
+        setProfileSecretId(getOrCreateSelfSecretId(nextUser.address || address || currentUser?.address));
       }
       setIsProfileModalOpen(false);
-      setNotice('Username saved. Your secret key stays linked to your wallet.');
+      setNotice('Username saved. Your secret key is derived from your wallet address.');
     } catch (saveError) {
       setError(saveError.message || 'Failed to save profile.');
     } finally {
@@ -662,17 +710,27 @@ function App() {
     setNotice('');
 
     try {
-      const resolvedPayload = await apiRequest('/api/users/resolve-secret', {
-        token,
-        method: 'POST',
-        body: { secretKey },
-      });
-
-      const resolvedUser = resolvedPayload.data;
-      const resolvedAddress = resolvedUser?.address;
+      let resolvedUser = null;
+      let resolvedAddress = resolveContactAddressFromInput(secretKey);
       if (!resolvedAddress) {
-        throw new Error('No user found for this secret ID.');
+        try {
+          const resolvedPayload = await apiRequest('/api/users/resolve-secret', {
+            token,
+            method: 'POST',
+            body: { secretKey },
+          });
+          resolvedAddress = resolvedPayload.data?.address || '';
+          resolvedUser = resolvedPayload.data || null;
+        } catch {
+          resolvedAddress = '';
+        }
       }
+
+      if (!resolvedAddress) {
+        throw new Error('Enter a wallet address or an sk- secret key.');
+      }
+
+      const contactSecretId = deriveSecretIdFromWalletAddress(resolvedAddress);
 
       const contactPayload = await apiRequest('/api/contacts', {
         token,
@@ -680,7 +738,6 @@ function App() {
         body: {
           address: resolvedAddress,
           username: resolvedUser?.username || undefined,
-          secretKey,
         },
       });
 
@@ -688,7 +745,8 @@ function App() {
       if (newContact) {
         const walletAddress = address || currentUser?.address;
         if (walletAddress) {
-          storeContactSecretId(walletAddress, newContact.id, newContact.secretKey || secretKey);
+          unhideContact(walletAddress, newContact.id);
+          storeContactSecretId(walletAddress, newContact.id, contactSecretId);
           if (activeContactId === newContact.id) {
             setRawMessages((prev) => [...prev]);
           }
@@ -718,14 +776,10 @@ function App() {
     setError('');
     setNotice('');
 
-    try {
-      await apiRequest(`/api/contacts/${contactId}`, {
-        token,
-        method: 'DELETE',
-      });
-
-      const walletAddress = address || currentUser?.address;
+    const walletAddress = address || currentUser?.address;
+    const removeFromUi = () => {
       if (walletAddress) {
+        hideContact(walletAddress, contactId);
         window.localStorage.removeItem(getContactSecretStorageKey(walletAddress, contactId));
       }
 
@@ -739,9 +793,22 @@ function App() {
         setActiveContactSecretId('');
         setIsChatLocked(false);
       }
+    };
 
+    try {
+      await apiRequest(`/api/contacts/${contactId}`, {
+        token,
+        method: 'DELETE',
+      });
+      removeFromUi();
       setNotice('Contact removed from your list.');
     } catch (deleteError) {
+      if (deleteError?.message?.includes('Contact not found')) {
+        removeFromUi();
+        setNotice('Contact removed from your list.');
+        return;
+      }
+
       setError(deleteError.message || 'Failed to delete contact.');
     }
   };
@@ -795,7 +862,13 @@ function App() {
     event.preventDefault();
     if (!msgInput.trim() || !activeChat?.id || !token) return;
 
-    if (!profileSecretId || !activeContactSecretId) {
+    const walletAddress = address || currentUser?.address;
+    const contactSecretId =
+      activeContactSecretId ||
+      (walletAddress ? getStoredContactSecretId(walletAddress, activeContactId) : '') ||
+      deriveSecretIdFromWalletAddress(activeContact?.address);
+
+    if (!profileSecretId || !contactSecretId) {
       setError('This chat is locked on this device. Add the contact Secret Key again to unlock it.');
       return;
     }
@@ -806,7 +879,7 @@ function App() {
     setNotice('');
 
     try {
-      const encryptedContent = await encryptTextForChat(content, profileSecretId, activeContactSecretId);
+      const encryptedContent = await encryptTextForChat(content, profileSecretId, contactSecretId);
       const payload = await apiRequest('/api/messages', {
         token,
         method: 'POST',
@@ -838,9 +911,6 @@ function App() {
       setError(sendError.message || 'Failed to send message.');
     }
   };
-
-  const activeContact = contacts.find((contact) => contact.id === activeContactId) || null;
-  const walletAddress = address || currentUser?.address || '';
 
   if (!token) {
     return (
@@ -891,13 +961,13 @@ function App() {
         </div>
 
         <form className="panel" onSubmit={addContactBySecret}>
-          <h4>Add Contact By Secret Key</h4>
+          <h4>Add Contact By Secret Key or Wallet Address</h4>
           <div className="add-row">
             <input
               type="text"
               value={contactSecretKey}
               onChange={(event) => setContactSecretKey(event.target.value)}
-              placeholder="Enter contact secret key"
+              placeholder="Enter contact secret key or wallet address"
               minLength={6}
               maxLength={64}
             />

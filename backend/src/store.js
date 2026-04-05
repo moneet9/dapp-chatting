@@ -36,6 +36,12 @@ function getDirectChatKey(chat) {
   return `direct:${participants[0]}:${participants[1]}`;
 }
 
+function deriveSecretIdFromWalletAddress(address) {
+  const wallet = normalizeWalletAddress(address);
+  if (!wallet) return '';
+  return `sk-${wallet.replace(/^0x/, '')}`;
+}
+
 async function getCollections() {
   const db = await connectDb();
   return {
@@ -52,22 +58,19 @@ async function upsertContact(ownerId, contactUser) {
 
   const { contacts } = await getCollections();
   const contactId = `${ownerId}:${contactUser.id}`;
-  const secretKey = normalizeSecretKey(contactUser.secretKey);
 
-  const update = {
-    $setOnInsert: {
-      _id: contactId,
-      ownerId,
-      contactId: contactUser.id,
-      createdAt: Date.now(),
+  await contacts.updateOne(
+    { _id: contactId },
+    {
+      $setOnInsert: {
+        _id: contactId,
+        ownerId,
+        contactId: contactUser.id,
+        createdAt: Date.now(),
+      },
     },
-  };
-
-  if (secretKey) {
-    update.$set = { secretKey };
-  }
-
-  await contacts.updateOne({ _id: contactId }, update, { upsert: true });
+    { upsert: true }
+  );
 }
 
 async function hydrateMessages(messages) {
@@ -88,7 +91,6 @@ async function hydrateMessages(messages) {
     return {
       ...message,
       senderUsername: sender.username,
-      senderSecretKey: sender.secretKey,
       senderAddress: sender.address,
     };
   });
@@ -146,7 +148,7 @@ function normalizeUsername(username, fallbackWallet) {
 }
 
 function buildPublicUser(doc, address) {
-  const publicUser = sanitizeUser(doc, { includeSecretKey: true });
+  const publicUser = sanitizeUser(doc);
   if (!publicUser) return null;
 
   if (address) {
@@ -162,9 +164,24 @@ export async function upsertUser(address, options = {}) {
   const userId = getOpaqueUserId(wallet);
   const now = Date.now();
   const username = normalizeUsername(options.preferredUsername, wallet);
-  const existingUser = await users.findOne({ _id: userId });
-  const existingSecretKey = normalizeSecretKey(existingUser?.secretKey);
-  const secretKey = existingSecretKey || `sk-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+
+  const existingByAddress = await users.findOne({ address: wallet });
+  if (existingByAddress) {
+    await users.updateOne(
+      { _id: existingByAddress._id },
+      {
+        $set: {
+          username: existingByAddress.username || username,
+          status: 'online',
+          lastSeen: now,
+          address: wallet,
+        },
+      }
+    );
+
+    const updatedUser = await users.findOne({ _id: existingByAddress._id });
+    return buildPublicUser(updatedUser, wallet);
+  }
 
   const update = {
     $setOnInsert: {
@@ -172,17 +189,12 @@ export async function upsertUser(address, options = {}) {
       id: userId,
       username,
       address: wallet,
-      secretKey,
     },
     $set: {
       status: 'online',
       lastSeen: now,
     },
   };
-
-  if (!existingSecretKey) {
-    update.$set.secretKey = secretKey;
-  }
 
   await users.updateOne(
     { _id: userId },
@@ -205,20 +217,29 @@ export async function getUserById(userId, options = {}) {
 }
 
 export async function resolveUserBySecretKey(secretKey) {
-  const { users, contacts } = await getCollections();
+  const { users } = await getCollections();
   const normalizedSecretKey = normalizeSecretKey(secretKey);
   if (!normalizedSecretKey) return null;
 
-  const directUser = await users.findOne({ secretKey: normalizedSecretKey });
+  const directAddressUser = await users.findOne({ address: normalizeWalletAddress(normalizedSecretKey) });
+  if (directAddressUser) {
+    return sanitizeUser(directAddressUser);
+  }
+
+  const userDocs = await users.find({}).toArray();
+  const directUser = userDocs.find((userDoc) => {
+    if (normalizeWalletAddress(userDoc.address) === normalizedSecretKey.toLowerCase()) {
+      return true;
+    }
+
+    return deriveSecretIdFromWalletAddress(userDoc.address) === normalizedSecretKey;
+  });
+
   if (directUser) {
     return sanitizeUser(directUser);
   }
 
-  const cachedContact = await contacts.findOne({ secretKey: normalizedSecretKey });
-  if (!cachedContact?.contactId) return null;
-
-  const contactUser = await users.findOne({ _id: cachedContact.contactId });
-  return sanitizeUser(contactUser);
+  return null;
 }
 
 export async function updateUsername(userId, username) {
@@ -283,16 +304,12 @@ export async function listContacts(ownerId) {
       const user = userById.get(contact.contactId);
       if (!user) return null;
 
-      if (contact.secretKey) {
-        user.secretKey = contact.secretKey;
-      }
-
       return user;
     })
     .filter(Boolean);
 }
 
-export async function addContact(ownerId, contactAddress, preferredUsername, secretKey) {
+export async function addContact(ownerId, contactAddress, preferredUsername) {
   const { contacts } = await getCollections();
   const normalizedAddress = normalizeWalletAddress(contactAddress);
   const contactUser = await upsertUser(normalizedAddress, { preferredUsername });
@@ -315,18 +332,6 @@ export async function addContact(ownerId, contactAddress, preferredUsername, sec
     },
     { upsert: true }
   );
-
-  const normalizedSecretKey = normalizeSecretKey(secretKey);
-  if (normalizedSecretKey) {
-    await contacts.updateOne(
-      { _id: id },
-      {
-        $set: {
-          secretKey: normalizedSecretKey,
-        },
-      }
-    );
-  }
 
   const { address: _address, ...contactWithoutAddress } = contactUser;
   return { contact: contactWithoutAddress };

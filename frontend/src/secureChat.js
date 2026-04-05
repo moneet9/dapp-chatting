@@ -10,6 +10,38 @@ function normalizeSecretId(secretId) {
   return String(secretId || '').trim();
 }
 
+export function deriveSecretIdFromWalletAddress(walletAddress) {
+  const normalizedWalletAddress = normalizeWalletAddress(walletAddress);
+  if (!normalizedWalletAddress) return '';
+
+  return `sk-${normalizedWalletAddress.replace(/^0x/, '')}`;
+}
+
+export function deriveWalletAddressFromSecretId(secretId) {
+  const normalizedSecretId = normalizeSecretId(secretId);
+  if (normalizedSecretId.toLowerCase().startsWith('0x')) {
+    return normalizedSecretId.toLowerCase();
+  }
+
+  if (!normalizedSecretId.startsWith('sk-')) return '';
+
+  const walletSuffix = normalizedSecretId.slice(3).trim();
+  if (!walletSuffix) return '';
+
+  return `0x${walletSuffix.replace(/^0x/, '')}`;
+}
+
+export function resolveContactAddressFromInput(inputValue) {
+  const normalizedInput = normalizeSecretId(inputValue);
+  if (!normalizedInput) return '';
+
+  if (normalizedInput.toLowerCase().startsWith('0x')) {
+    return normalizedInput.toLowerCase();
+  }
+
+  return deriveWalletAddressFromSecretId(normalizedInput);
+}
+
 function bytesToBase64(bytes) {
   let binary = '';
   for (const value of bytes) {
@@ -47,20 +79,12 @@ export function getContactSecretStorageKey(walletAddress, contactId) {
   return `${APP_SCOPE}:contact:${normalizeWalletAddress(walletAddress)}:${String(contactId || '').trim()}`;
 }
 
+export function getHiddenContactStorageKey(walletAddress, contactId) {
+  return `${APP_SCOPE}:hidden-contact:${normalizeWalletAddress(walletAddress)}:${String(contactId || '').trim()}`;
+}
+
 export function getOrCreateSelfSecretId(walletAddress) {
-  if (!walletAddress || typeof window === 'undefined') return '';
-
-  const storageKey = getSelfSecretStorageKey(walletAddress);
-  const existingSecretId = window.localStorage.getItem(storageKey);
-  if (existingSecretId) return existingSecretId;
-
-  const randomPart = window.crypto?.randomUUID
-    ? window.crypto.randomUUID().replace(/-/g, '').slice(0, 18)
-    : Math.random().toString(36).slice(2, 20);
-
-  const nextSecretId = `sec-${randomPart}`;
-  window.localStorage.setItem(storageKey, nextSecretId);
-  return nextSecretId;
+  return deriveSecretIdFromWalletAddress(walletAddress);
 }
 
 export function getStoredContactSecretId(walletAddress, contactId) {
@@ -73,6 +97,21 @@ export function storeContactSecretId(walletAddress, contactId, secretId) {
   const normalizedSecretId = normalizeSecretId(secretId);
   if (!normalizedSecretId) return;
   window.localStorage.setItem(getContactSecretStorageKey(walletAddress, contactId), normalizedSecretId);
+}
+
+export function isHiddenContact(walletAddress, contactId) {
+  if (!walletAddress || !contactId || typeof window === 'undefined') return false;
+  return window.localStorage.getItem(getHiddenContactStorageKey(walletAddress, contactId)) === '1';
+}
+
+export function hideContact(walletAddress, contactId) {
+  if (!walletAddress || !contactId || typeof window === 'undefined') return;
+  window.localStorage.setItem(getHiddenContactStorageKey(walletAddress, contactId), '1');
+}
+
+export function unhideContact(walletAddress, contactId) {
+  if (!walletAddress || !contactId || typeof window === 'undefined') return;
+  window.localStorage.removeItem(getHiddenContactStorageKey(walletAddress, contactId));
 }
 
 export async function encryptTextForChat(plainText, selfSecretId, contactSecretId) {

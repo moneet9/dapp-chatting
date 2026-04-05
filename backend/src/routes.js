@@ -21,6 +21,7 @@ import {
   updateGroup,
   upsertUser,
 } from './store.js';
+import { getSocketServer } from './socket.js';
 
 const loginSchema = z.object({
   address: z.string().startsWith('0x'),
@@ -72,7 +73,6 @@ const updateProfileSchema = z.object({
 const addContactSchema = z.object({
   address: z.string().startsWith('0x'),
   username: z.string().trim().min(2).max(32).optional(),
-  secretKey: z.string().trim().min(6).optional(),
 });
 
 const resolveSecretSchema = z.object({
@@ -133,7 +133,7 @@ export function createApiRouter() {
   router.use(authMiddleware);
 
   router.get('/me', asyncRoute(async (req, res) => {
-    const user = await getUserById(req.user.id, { includeSecretKey: true });
+    const user = await getUserById(req.user.id);
     if (!user) return fail(res, 404, 'User not found');
     return ok(res, { ...user, address: req.user.address });
   }));
@@ -159,7 +159,7 @@ export function createApiRouter() {
     const parsed = addContactSchema.safeParse(req.body);
     if (!parsed.success) return fail(res, 400, parsed.error.issues[0]?.message || 'Invalid payload');
 
-    const result = await addContact(req.user.id, parsed.data.address, parsed.data.username, parsed.data.secretKey);
+    const result = await addContact(req.user.id, parsed.data.address, parsed.data.username);
     if (result.error) return fail(res, 400, result.error);
 
     return ok(res, result.contact);
@@ -231,6 +231,19 @@ export function createApiRouter() {
 
     const result = await saveMessage(parsed.data, req.user.id);
     if (result.error) return fail(res, 400, result.error);
+
+    const io = getSocketServer();
+    if (io?.to) {
+      const participantRooms = Array.isArray(result.participants)
+        ? [...new Set(result.participants.map((participantId) => `user:${participantId}`))]
+        : [];
+
+      io.to(parsed.data.chatId).emit('message:new', result.message);
+      for (const room of participantRooms) {
+        io.to(room).emit('message:new', result.message);
+      }
+    }
+
     return ok(res, result.message);
   }));
 
