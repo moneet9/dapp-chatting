@@ -14,7 +14,20 @@ function withSocketError(socket, handler) {
 export function createSocketServer(httpServer, corsOrigin) {
   const io = new Server(httpServer, {
     cors: {
-      origin: corsOrigin,
+      origin: (origin, callback) => {
+        if (!origin) {
+          callback(null, true);
+          return;
+        }
+
+        try {
+          const url = new URL(origin);
+          const allowed = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1';
+          callback(null, allowed || origin === corsOrigin);
+        } catch {
+          callback(null, origin === corsOrigin);
+        }
+      },
       credentials: true,
     },
   });
@@ -34,6 +47,7 @@ export function createSocketServer(httpServer, corsOrigin) {
 
   io.on('connection', (socket) => {
     const currentUser = socket.data.user;
+    socket.join(`user:${currentUser.id}`);
     setUserStatus(currentUser.id, 'online').catch((error) => {
       console.error('Failed to set user online status:', error);
     });
@@ -74,12 +88,19 @@ export function createSocketServer(httpServer, corsOrigin) {
         return;
       }
 
+      const participantRooms = Array.isArray(result.participants)
+        ? [...new Set(result.participants.map((participantId) => `user:${participantId}`))]
+        : [];
+
       socket.emit('message:status', {
         messageId: payload.tempId || result.message.id,
         status: 'sent',
       });
 
       io.to(payload.chatId).emit('message:new', result.message);
+      for (const room of participantRooms) {
+        io.to(room).emit('message:new', result.message);
+      }
 
       socket.emit('message:status', {
         messageId: payload.tempId || result.message.id,

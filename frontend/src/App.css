@@ -240,6 +240,13 @@ h4 {
   gap: 10px;
 }
 
+.contact-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .contact-name {
   font-weight: 600;
   white-space: nowrap;
@@ -250,6 +257,28 @@ h4 {
 .contact-time {
   font-size: 11px;
   color: #9ca3af;
+}
+
+.contact-delete-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid #4b5563;
+  background: #111827;
+  color: #fca5a5;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.contact-delete-btn:hover {
+  background: #3f1d24;
+  border-color: #f87171;
+  color: #fecaca;
 }
 
 .contact-preview {
@@ -284,6 +313,23 @@ h4 {
   border-bottom: 1px solid #7c5a1f;
   color: #fde68a;
   font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.locked-banner-text {
+  line-height: 1.5;
+}
+
+.locked-banner-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.lock-action {
+  padding: 8px 12px;
 }
 
 .messages {

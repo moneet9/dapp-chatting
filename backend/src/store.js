@@ -10,6 +10,17 @@ function toClientDocument(doc) {
   return rest;
 }
 
+function sanitizeUser(doc, { includeSecretKey = false } = {}) {
+  const user = toClientDocument(doc);
+  if (!user) return null;
+
+  if (!includeSecretKey) {
+    delete user.secretKey;
+  }
+
+  return user;
+}
+
 function toClientDocuments(docs) {
   return docs.map(toClientDocument);
 }
@@ -34,6 +45,53 @@ async function getCollections() {
     nonces: db.collection('nonces'),
     contacts: db.collection('contacts'),
   };
+}
+
+async function upsertContact(ownerId, contactUser) {
+  if (!ownerId || !contactUser?.id || ownerId === contactUser.id) return;
+
+  const { contacts } = await getCollections();
+  const contactId = `${ownerId}:${contactUser.id}`;
+  const secretKey = normalizeSecretKey(contactUser.secretKey);
+
+  const update = {
+    $setOnInsert: {
+      _id: contactId,
+      ownerId,
+      contactId: contactUser.id,
+      createdAt: Date.now(),
+    },
+  };
+
+  if (secretKey) {
+    update.$set = { secretKey };
+  }
+
+  await contacts.updateOne({ _id: contactId }, update, { upsert: true });
+}
+
+async function hydrateMessages(messages) {
+  const normalizedMessages = Array.isArray(messages) ? messages.map(toClientDocument).filter(Boolean) : [];
+  if (normalizedMessages.length === 0) return [];
+
+  const senderIds = [...new Set(normalizedMessages.map((message) => message.senderId).filter(Boolean))];
+  if (senderIds.length === 0) return normalizedMessages;
+
+  const { users } = await getCollections();
+  const userDocs = await users.find({ _id: { $in: senderIds } }).toArray();
+  const userById = new Map(userDocs.map((userDoc) => [userDoc._id, userDoc]));
+
+  return normalizedMessages.map((message) => {
+    const sender = userById.get(message.senderId);
+    if (!sender) return message;
+
+    return {
+      ...message,
+      senderUsername: sender.username,
+      senderSecretKey: sender.secretKey,
+      senderAddress: sender.address,
+    };
+  });
 }
 
 export async function issueNonce(address) {
@@ -88,10 +146,13 @@ function normalizeUsername(username, fallbackWallet) {
 }
 
 function buildPublicUser(doc, address) {
-  const publicUser = toClientDocument(doc);
+  const publicUser = sanitizeUser(doc, { includeSecretKey: true });
+  if (!publicUser) return null;
+
   if (address) {
     publicUser.address = normalizeWalletAddress(address);
   }
+
   return publicUser;
 }
 
@@ -101,20 +162,31 @@ export async function upsertUser(address, options = {}) {
   const userId = getOpaqueUserId(wallet);
   const now = Date.now();
   const username = normalizeUsername(options.preferredUsername, wallet);
+  const existingUser = await users.findOne({ _id: userId });
+  const existingSecretKey = normalizeSecretKey(existingUser?.secretKey);
+  const secretKey = existingSecretKey || `sk-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+
+  const update = {
+    $setOnInsert: {
+      _id: userId,
+      id: userId,
+      username,
+      address: wallet,
+      secretKey,
+    },
+    $set: {
+      status: 'online',
+      lastSeen: now,
+    },
+  };
+
+  if (!existingSecretKey) {
+    update.$set.secretKey = secretKey;
+  }
 
   await users.updateOne(
     { _id: userId },
-    {
-      $setOnInsert: {
-        _id: userId,
-        id: userId,
-        username,
-      },
-      $set: {
-        status: 'online',
-        lastSeen: now,
-      },
-    },
+    update,
     { upsert: true }
   );
 
@@ -122,10 +194,31 @@ export async function upsertUser(address, options = {}) {
   return buildPublicUser(user, wallet);
 }
 
-export async function getUserById(userId) {
+function normalizeSecretKey(secretKey) {
+  return String(secretKey || '').trim();
+}
+
+export async function getUserById(userId, options = {}) {
   const { users } = await getCollections();
   const user = await users.findOne({ _id: userId });
-  return toClientDocument(user);
+  return sanitizeUser(user, { includeSecretKey: Boolean(options.includeSecretKey) });
+}
+
+export async function resolveUserBySecretKey(secretKey) {
+  const { users, contacts } = await getCollections();
+  const normalizedSecretKey = normalizeSecretKey(secretKey);
+  if (!normalizedSecretKey) return null;
+
+  const directUser = await users.findOne({ secretKey: normalizedSecretKey });
+  if (directUser) {
+    return sanitizeUser(directUser);
+  }
+
+  const cachedContact = await contacts.findOne({ secretKey: normalizedSecretKey });
+  if (!cachedContact?.contactId) return null;
+
+  const contactUser = await users.findOne({ _id: cachedContact.contactId });
+  return sanitizeUser(contactUser);
 }
 
 export async function updateUsername(userId, username) {
@@ -173,7 +266,7 @@ export async function setUserStatus(userId, status) {
 export async function listUsers() {
   const { users } = await getCollections();
   const docs = await users.find({}).sort({ lastSeen: -1 }).toArray();
-  return toClientDocuments(docs);
+  return toClientDocuments(docs).map((doc) => sanitizeUser(doc));
 }
 
 export async function listContacts(ownerId) {
@@ -183,14 +276,23 @@ export async function listContacts(ownerId) {
 
   const contactIds = contactDocs.map((contact) => contact.contactId);
   const userDocs = await users.find({ _id: { $in: contactIds } }).toArray();
-  const userById = new Map(userDocs.map((userDoc) => [userDoc._id, toClientDocument(userDoc)]));
+  const userById = new Map(userDocs.map((userDoc) => [userDoc._id, sanitizeUser(userDoc)]));
 
   return contactDocs
-    .map((contact) => userById.get(contact.contactId))
+    .map((contact) => {
+      const user = userById.get(contact.contactId);
+      if (!user) return null;
+
+      if (contact.secretKey) {
+        user.secretKey = contact.secretKey;
+      }
+
+      return user;
+    })
     .filter(Boolean);
 }
 
-export async function addContact(ownerId, contactAddress, preferredUsername) {
+export async function addContact(ownerId, contactAddress, preferredUsername, secretKey) {
   const { contacts } = await getCollections();
   const normalizedAddress = normalizeWalletAddress(contactAddress);
   const contactUser = await upsertUser(normalizedAddress, { preferredUsername });
@@ -214,8 +316,35 @@ export async function addContact(ownerId, contactAddress, preferredUsername) {
     { upsert: true }
   );
 
+  const normalizedSecretKey = normalizeSecretKey(secretKey);
+  if (normalizedSecretKey) {
+    await contacts.updateOne(
+      { _id: id },
+      {
+        $set: {
+          secretKey: normalizedSecretKey,
+        },
+      }
+    );
+  }
+
   const { address: _address, ...contactWithoutAddress } = contactUser;
   return { contact: contactWithoutAddress };
+}
+
+export async function removeContact(ownerId, contactId) {
+  const { contacts } = await getCollections();
+  const normalizedContactId = String(contactId || '').trim();
+  if (!normalizedContactId) {
+    return { error: 'Contact not found' };
+  }
+
+  const result = await contacts.deleteOne({ ownerId, contactId: normalizedContactId });
+  if (!result.deletedCount) {
+    return { error: 'Contact not found' };
+  }
+
+  return { ok: true };
 }
 
 export async function searchUsers(query) {
@@ -225,7 +354,7 @@ export async function searchUsers(query) {
   const { users } = await getCollections();
   const regex = new RegExp(escapeRegex(q), 'i');
   const docs = await users.find({ username: regex }).toArray();
-  return toClientDocuments(docs);
+  return toClientDocuments(docs).map((doc) => sanitizeUser(doc));
 }
 
 export async function listChatsForUser(userId) {
@@ -363,7 +492,7 @@ export async function getMessages(chatId) {
 }
 
 export async function saveMessage(payload, senderId) {
-  const { chats, messages } = await getCollections();
+  const { chats, messages, users } = await getCollections();
   const chat = await chats.findOne({ _id: payload.chatId });
   if (!chat) {
     return { error: 'Chat not found' };
@@ -394,6 +523,28 @@ export async function saveMessage(payload, senderId) {
 
   await messages.insertOne(message);
 
+  if (chat.type === 'direct' && Array.isArray(chat.participants)) {
+    const participantIds = [...new Set(chat.participants)].filter(Boolean);
+    const participantDocs = await users.find({ _id: { $in: participantIds } }).toArray();
+    const participantById = new Map(participantDocs.map((userDoc) => [userDoc._id, userDoc]));
+
+    const senderUser = participantById.get(senderId);
+    if (senderUser) {
+      for (const participantId of participantIds) {
+        if (participantId === senderId) continue;
+        await upsertContact(participantId, senderUser);
+      }
+    }
+
+    const recipientIds = participantIds.filter((participantId) => participantId !== senderId);
+    for (const recipientId of recipientIds) {
+      const recipientUser = participantById.get(recipientId);
+      if (recipientUser) {
+        await upsertContact(senderId, recipientUser);
+      }
+    }
+  }
+
   const lastMessage = toClientDocument(message);
   await chats.updateOne(
     { _id: payload.chatId },
@@ -405,5 +556,9 @@ export async function saveMessage(payload, senderId) {
     }
   );
 
-  return { message: lastMessage };
+  const [enrichedMessage] = await hydrateMessages([lastMessage]);
+  return {
+    message: enrichedMessage || lastMessage,
+    participants: chat.participants,
+  };
 }

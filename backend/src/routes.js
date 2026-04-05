@@ -13,7 +13,9 @@ import {
   listContacts,
   listUsers,
   removeParticipant,
+  removeContact,
   saveMessage,
+  resolveUserBySecretKey,
   searchUsers,
   updateUsername,
   updateGroup,
@@ -70,6 +72,11 @@ const updateProfileSchema = z.object({
 const addContactSchema = z.object({
   address: z.string().startsWith('0x'),
   username: z.string().trim().min(2).max(32).optional(),
+  secretKey: z.string().trim().min(6).optional(),
+});
+
+const resolveSecretSchema = z.object({
+  secretKey: z.string().trim().min(6),
 });
 
 function ok(res, data) {
@@ -101,6 +108,16 @@ export function createApiRouter() {
     return ok(res, { nonce });
   }));
 
+  router.post('/users/resolve-secret', asyncRoute(async (req, res) => {
+    const parsed = resolveSecretSchema.safeParse(req.body);
+    if (!parsed.success) return fail(res, 400, parsed.error.issues[0]?.message || 'Invalid payload');
+
+    const user = await resolveUserBySecretKey(parsed.data.secretKey);
+    if (!user) return fail(res, 404, 'No user found for this secret key');
+
+    return ok(res, user);
+  }));
+
   router.post('/auth/login', asyncRoute(async (req, res) => {
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) return fail(res, 400, parsed.error.issues[0]?.message || 'Invalid payload');
@@ -116,7 +133,7 @@ export function createApiRouter() {
   router.use(authMiddleware);
 
   router.get('/me', asyncRoute(async (req, res) => {
-    const user = await getUserById(req.user.id);
+    const user = await getUserById(req.user.id, { includeSecretKey: true });
     if (!user) return fail(res, 404, 'User not found');
     return ok(res, { ...user, address: req.user.address });
   }));
@@ -142,10 +159,16 @@ export function createApiRouter() {
     const parsed = addContactSchema.safeParse(req.body);
     if (!parsed.success) return fail(res, 400, parsed.error.issues[0]?.message || 'Invalid payload');
 
-    const result = await addContact(req.user.id, parsed.data.address, parsed.data.username);
+    const result = await addContact(req.user.id, parsed.data.address, parsed.data.username, parsed.data.secretKey);
     if (result.error) return fail(res, 400, result.error);
 
     return ok(res, result.contact);
+  }));
+
+  router.delete('/contacts/:contactId', asyncRoute(async (req, res) => {
+    const result = await removeContact(req.user.id, req.params.contactId);
+    if (result.error) return fail(res, 404, result.error);
+    return ok(res, { removed: true });
   }));
 
   router.get('/users', asyncRoute(async (_req, res) => ok(res, await listUsers())));

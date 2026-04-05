@@ -2,18 +2,17 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ethers } from 'ethers';
 import { io } from 'socket.io-client';
 import { LogOut, Plus, Send, UserRound } from 'lucide-react';
-import { CHAT_REGISTRY_ABI } from './chatRegistryAbi.js';
 import {
   decryptTextForChat,
   encryptTextForChat,
   getOrCreateSelfSecretId,
+  getContactSecretStorageKey,
   getStoredContactSecretId,
   storeContactSecretId,
 } from './secureChat.js';
 import './App.css';
 
-const BACKEND_URL = 'http://localhost:3001';
-const CHAT_REGISTRY_ADDRESS = import.meta.env.VITE_CHAT_REGISTRY_ADDRESS || '';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
 
 function decodeToken(token) {
   if (!token) return null;
@@ -74,6 +73,44 @@ function normalizeChats(chatItems) {
   return normalized;
 }
 
+function mergeContactsWithChats(contactItems, chatItems, userItems, currentUserId) {
+  const contactsById = new Map();
+
+  for (const contact of Array.isArray(contactItems) ? contactItems : []) {
+    if (contact?.id) {
+      contactsById.set(contact.id, contact);
+    }
+  }
+
+  const usersById = new Map((Array.isArray(userItems) ? userItems : []).map((user) => [user.id, user]));
+
+  for (const chat of Array.isArray(chatItems) ? chatItems : []) {
+    if (chat.type !== 'direct' || !Array.isArray(chat.participants) || !currentUserId) continue;
+
+    const peerId = chat.participants.find((participantId) => participantId !== currentUserId);
+    if (!peerId || contactsById.has(peerId)) continue;
+
+    const peerUser = usersById.get(peerId);
+    if (!peerUser) continue;
+
+    contactsById.set(peerId, peerUser);
+  }
+
+  return Array.from(contactsById.values());
+}
+
+function upsertContactFromMessage(message, walletAddress, currentUserId) {
+  if (!walletAddress || !currentUserId || !message?.senderId || message.senderId === currentUserId) {
+    return null;
+  }
+
+  return {
+    id: message.senderId,
+    username: message.senderUsername || fallbackName(message.senderId, 'Contact'),
+    secretKey: message.senderSecretKey || '',
+  };
+}
+
 async function apiRequest(path, { token, method = 'GET', body } = {}) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -91,13 +128,6 @@ async function apiRequest(path, { token, method = 'GET', body } = {}) {
   }
 
   return payload;
-}
-
-function getRegistry(providerOrSigner) {
-  if (!CHAT_REGISTRY_ADDRESS) {
-    throw new Error('Set VITE_CHAT_REGISTRY_ADDRESS in frontend/.env');
-  }
-  return new ethers.Contract(CHAT_REGISTRY_ADDRESS, CHAT_REGISTRY_ABI, providerOrSigner);
 }
 
 function fallbackName(value, prefix = 'User') {
@@ -131,6 +161,7 @@ function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const activeChatIdRef = useRef(null);
+  const walletConnectRef = useRef(null);
 
   useEffect(() => {
     activeChatIdRef.current = activeChat?.id || null;
@@ -178,8 +209,8 @@ function App() {
     const walletAddress = address || currentUser?.address;
     if (!walletAddress) return;
 
-    setProfileSecretId(getOrCreateSelfSecretId(walletAddress));
-  }, [token, address, currentUser?.address]);
+    setProfileSecretId(currentUser?.secretKey || getOrCreateSelfSecretId(walletAddress));
+  }, [token, address, currentUser?.address, currentUser?.secretKey]);
 
   const connectWallet = async () => {
     if (!window.ethereum) {
@@ -187,42 +218,67 @@ function App() {
       return;
     }
 
+    if (walletConnectRef.current) {
+      return walletConnectRef.current;
+    }
+
     setIsConnecting(true);
     setError('');
     setNotice('');
 
-    try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const accounts = await provider.send('eth_requestAccounts', []);
-      const userAddress = accounts[0];
-      setAddress(userAddress);
+    walletConnectRef.current = (async () => {
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const existingAccounts = await provider.send('eth_accounts', []);
+        const accounts =
+          Array.isArray(existingAccounts) && existingAccounts.length > 0
+            ? existingAccounts
+            : await provider.send('eth_requestAccounts', []);
 
-      const noncePayload = await apiRequest(`/api/auth/nonce/${userAddress}`);
-      const nonce = noncePayload.data?.nonce;
-      if (!nonce) throw new Error('Unable to issue login nonce.');
+        const userAddress = accounts[0];
+        if (!userAddress) {
+          throw new Error('No wallet account was returned.');
+        }
 
-      const message = `Please sign this message to verify your identity. Nonce: ${nonce}`;
-      const signer = await provider.getSigner();
-      const signature = await signer.signMessage(message);
+        setAddress(userAddress);
 
-      const loginPayload = await apiRequest('/api/auth/login', {
-        method: 'POST',
-        body: { address: userAddress, signature, message },
-      });
+        const noncePayload = await apiRequest(`/api/auth/nonce/${userAddress}`);
+        const nonce = noncePayload.data?.nonce;
+        if (!nonce) throw new Error('Unable to issue login nonce.');
 
-      const nextToken = loginPayload.data?.token;
-      if (!nextToken) throw new Error('Login failed: token missing.');
+        const message = `Please sign this message to verify your identity. Nonce: ${nonce}`;
+        const signer = await provider.getSigner();
+        const signature = await signer.signMessage(message);
 
-      localStorage.setItem('token', nextToken);
-      setToken(nextToken);
-      setCurrentUser(loginPayload.data?.user || decodeToken(nextToken));
-      setAddress(loginPayload.data?.user?.address || userAddress);
-    } catch (connectionError) {
-      console.error('Connection failed:', connectionError);
-      setError(connectionError.message || 'Connection failed.');
-    } finally {
-      setIsConnecting(false);
-    }
+        const loginPayload = await apiRequest('/api/auth/login', {
+          method: 'POST',
+          body: { address: userAddress, signature, message },
+        });
+
+        const nextToken = loginPayload.data?.token;
+        if (!nextToken) throw new Error('Login failed: token missing.');
+
+        localStorage.setItem('token', nextToken);
+        setToken(nextToken);
+        setCurrentUser(loginPayload.data?.user || decodeToken(nextToken));
+        setAddress(loginPayload.data?.user?.address || userAddress);
+        setProfileSecretId(loginPayload.data?.user?.secretKey || getOrCreateSelfSecretId(userAddress));
+      } catch (connectionError) {
+        console.error('Connection failed:', connectionError);
+
+        if (connectionError?.code === -32002) {
+          setError('A wallet approval request is already pending. Open your wallet and complete it, then try again if needed.');
+          return;
+        }
+
+        setError(connectionError.message || 'Connection failed.');
+      } finally {
+        setIsConnecting(false);
+        walletConnectRef.current = null;
+      }
+    })();
+
+    return walletConnectRef.current;
   };
 
   const logout = () => {
@@ -255,10 +311,11 @@ function App() {
 
     (async () => {
       try {
-        const [mePayload, contactsPayload, chatsPayload] = await Promise.all([
+        const [mePayload, contactsPayload, chatsPayload, usersPayload] = await Promise.all([
           apiRequest('/api/me', { token }),
           apiRequest('/api/contacts', { token }),
           apiRequest('/api/chats', { token }),
+          apiRequest('/api/users', { token }),
         ]);
 
         if (cancelled) return;
@@ -266,11 +323,12 @@ function App() {
         const me = mePayload.data;
         const contactItems = Array.isArray(contactsPayload.data) ? contactsPayload.data : [];
         const chatItems = normalizeChats(chatsPayload.data?.items || []);
+        const userItems = Array.isArray(usersPayload.data) ? usersPayload.data : [];
 
         setCurrentUser(me);
         setAddress(me?.address || null);
         setProfileUsername(me?.username || '');
-        setContacts(contactItems);
+        setContacts(mergeContactsWithChats(contactItems, chatItems, userItems, me?.id));
         setChats(chatItems);
 
         if (activeContactId) {
@@ -293,18 +351,113 @@ function App() {
   }, [token, activeContactId]);
 
   useEffect(() => {
+    const walletAddress = address || currentUser?.address;
+    if (!walletAddress || !Array.isArray(contacts) || contacts.length === 0) return;
+
+    for (const contact of contacts) {
+      if (contact?.id && contact?.secretKey) {
+        storeContactSecretId(walletAddress, contact.id, contact.secretKey);
+      }
+    }
+  }, [contacts, address, currentUser?.address]);
+
+  useEffect(() => {
+    const walletAddress = address || currentUser?.address;
+    if (!walletAddress || !currentUser?.id || !Array.isArray(rawMessages) || rawMessages.length === 0) return;
+
+    for (const message of rawMessages) {
+      const contact = upsertContactFromMessage(message, walletAddress, currentUser.id);
+      if (!contact?.secretKey) continue;
+
+      storeContactSecretId(walletAddress, contact.id, contact.secretKey);
+      setContacts((prev) => {
+        const existingIndex = prev.findIndex((item) => item.id === contact.id);
+        if (existingIndex === -1) {
+          return [...prev, contact];
+        }
+
+        const nextContacts = [...prev];
+        nextContacts[existingIndex] = {
+          ...nextContacts[existingIndex],
+          ...contact,
+        };
+        return nextContacts;
+      });
+
+      setChats((prev) => {
+        const existingChat = prev.find((chat) => chat.id === message.chatId);
+        if (existingChat) {
+          return prev;
+        }
+
+        const placeholderChat = {
+          id: message.chatId,
+          type: 'direct',
+          participants: [currentUser.id, message.senderId],
+          lastMessage: message,
+          lastMessageTime: message.timestamp,
+          unreadCount: 0,
+          createdAt: message.timestamp,
+        };
+
+        return [placeholderChat, ...prev];
+      });
+    }
+  }, [rawMessages, address, currentUser?.address, currentUser?.id]);
+
+  useEffect(() => {
     if (!token) return;
 
-    const newSocket = io(BACKEND_URL, { auth: { token } });
+    const newSocket = io(BACKEND_URL, {
+      auth: { token },
+      transports: ['websocket'],
+    });
 
     newSocket.on('connect_error', (socketError) => {
       setError(socketError.message || 'Socket connection failed.');
     });
 
     newSocket.on('message:new', (message) => {
+      const walletAddress = address || currentUser?.address;
+      const incomingContact = upsertContactFromMessage(message, walletAddress, currentUser?.id);
+
+      if (incomingContact?.secretKey && walletAddress) {
+        storeContactSecretId(walletAddress, incomingContact.id, incomingContact.secretKey);
+        setContacts((prev) => {
+          const existingIndex = prev.findIndex((item) => item.id === incomingContact.id);
+          if (existingIndex === -1) {
+            return [...prev, incomingContact];
+          }
+
+          const nextContacts = [...prev];
+          nextContacts[existingIndex] = {
+            ...nextContacts[existingIndex],
+            ...incomingContact,
+          };
+          return nextContacts;
+        });
+      }
+
       setChats((prev) => {
         const existingChat = prev.find((chat) => chat.id === message.chatId);
-        if (!existingChat) return prev;
+        if (!existingChat) {
+          if (message.senderId && currentUser?.id && message.senderId !== currentUser.id) {
+            return [
+              {
+                id: message.chatId,
+                type: 'direct',
+                participants: [currentUser.id, message.senderId],
+                lastMessage: message,
+                lastMessageTime: message.timestamp,
+                unreadCount: 0,
+                createdAt: message.timestamp,
+              },
+              ...prev,
+            ];
+          }
+
+          return prev;
+        }
 
         const updatedChat = {
           ...existingChat,
@@ -316,7 +469,7 @@ function App() {
       });
 
       if (message.chatId === activeChatIdRef.current) {
-        setRawMessages((prev) => [...prev, message]);
+        setRawMessages((prev) => (prev.some((item) => item.id === message.id) ? prev : [...prev, message]));
       }
     });
 
@@ -452,16 +605,8 @@ function App() {
     if (!token) return;
 
     const username = profileUsername.trim();
-    const walletAddress = address || currentUser?.address;
-    const secretId = profileSecretId || getOrCreateSelfSecretId(walletAddress);
-
     if (username.length < 2 || username.length > 32) {
       setError('Username must be 2 to 32 characters.');
-      return;
-    }
-
-    if (!secretId) {
-      setError('Unable to prepare your secret ID.');
       return;
     }
 
@@ -486,28 +631,10 @@ function App() {
       if (nextUser) {
         setCurrentUser(nextUser);
         setProfileUsername(nextUser.username || username);
+        setProfileSecretId(nextUser.secretKey || profileSecretId || '');
       }
-
-      if (CHAT_REGISTRY_ADDRESS) {
-        if (!window.ethereum) {
-          throw new Error('MetaMask is required to register secret ID on blockchain.');
-        }
-
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        const signer = await provider.getSigner();
-        const registry = getRegistry(signer);
-
-        const tx = await registry.upsertProfile(username, secretId);
-        await tx.wait();
-      }
-
-      setProfileSecretId(secretId);
       setIsProfileModalOpen(false);
-      setNotice(
-        CHAT_REGISTRY_ADDRESS
-          ? 'Username saved. Keep your Secret ID safe because it unlocks private chats.'
-          : 'Username saved locally. Set contract address later to publish your Secret ID on-chain.'
-      );
+      setNotice('Username saved. Your secret key stays linked to your wallet.');
     } catch (saveError) {
       setError(saveError.message || 'Failed to save profile.');
     } finally {
@@ -517,16 +644,16 @@ function App() {
 
   const addContactBySecret = async (event) => {
     event.preventDefault();
+
+    await submitContactSecret(contactSecretKey);
+  };
+
+  const submitContactSecret = async (secretValue) => {
     if (!token) return;
 
-    const secretKey = contactSecretKey.trim();
+    const secretKey = String(secretValue || '').trim();
     if (secretKey.length < 6) {
       setError('Secret ID must be at least 6 characters.');
-      return;
-    }
-
-    if (!window.ethereum) {
-      setError('MetaMask is required to search contact on blockchain.');
       return;
     }
 
@@ -535,22 +662,25 @@ function App() {
     setNotice('');
 
     try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const registry = getRegistry(provider);
+      const resolvedPayload = await apiRequest('/api/users/resolve-secret', {
+        token,
+        method: 'POST',
+        body: { secretKey },
+      });
 
-      const resolvedAddress = await registry.resolveContactKey(secretKey);
-      if (!resolvedAddress || resolvedAddress === ethers.ZeroAddress) {
+      const resolvedUser = resolvedPayload.data;
+      const resolvedAddress = resolvedUser?.address;
+      if (!resolvedAddress) {
         throw new Error('No user found for this secret ID.');
       }
-
-      const [chainUsername] = await registry.getProfile(resolvedAddress);
 
       const contactPayload = await apiRequest('/api/contacts', {
         token,
         method: 'POST',
         body: {
           address: resolvedAddress,
-          username: chainUsername || undefined,
+          username: resolvedUser?.username || undefined,
+          secretKey,
         },
       });
 
@@ -558,7 +688,7 @@ function App() {
       if (newContact) {
         const walletAddress = address || currentUser?.address;
         if (walletAddress) {
-          storeContactSecretId(walletAddress, newContact.id, secretKey);
+          storeContactSecretId(walletAddress, newContact.id, newContact.secretKey || secretKey);
           if (activeContactId === newContact.id) {
             setRawMessages((prev) => [...prev]);
           }
@@ -571,11 +701,93 @@ function App() {
       }
 
       setContactSecretKey('');
-      setNotice('Contact added from blockchain secret ID.');
+      setNotice('Contact added from secret key.');
     } catch (addError) {
       setError(addError.message || 'Failed to add contact.');
     } finally {
       setIsAddingContact(false);
+    }
+  };
+
+  const deleteContact = async (contactId) => {
+    if (!token || !contactId) return;
+
+    const confirmed = window.confirm('Delete this contact from your list?');
+    if (!confirmed) return;
+
+    setError('');
+    setNotice('');
+
+    try {
+      await apiRequest(`/api/contacts/${contactId}`, {
+        token,
+        method: 'DELETE',
+      });
+
+      const walletAddress = address || currentUser?.address;
+      if (walletAddress) {
+        window.localStorage.removeItem(getContactSecretStorageKey(walletAddress, contactId));
+      }
+
+      setContacts((prev) => prev.filter((item) => item.id !== contactId));
+
+      if (activeContactId === contactId) {
+        setActiveContactId(null);
+        setActiveChat(null);
+        setRawMessages([]);
+        setMessages([]);
+        setActiveContactSecretId('');
+        setIsChatLocked(false);
+      }
+
+      setNotice('Contact removed from your list.');
+    } catch (deleteError) {
+      setError(deleteError.message || 'Failed to delete contact.');
+    }
+  };
+
+  const pasteContactSecret = async () => {
+    if (!window?.navigator?.clipboard?.readText) {
+      setError('Clipboard paste is not available in this browser.');
+      return;
+    }
+
+    try {
+      const pastedValue = await window.navigator.clipboard.readText();
+      const secretKey = String(pastedValue || '').trim();
+      if (!secretKey) {
+        setError('Clipboard is empty.');
+        return;
+      }
+
+      setContactSecretKey(secretKey);
+
+      const walletAddress = address || currentUser?.address;
+      if (activeContactId && walletAddress) {
+        storeContactSecretId(walletAddress, activeContactId, secretKey);
+        setActiveContactSecretId(secretKey);
+        setIsChatLocked(false);
+
+        try {
+          const decryptedMessages = await Promise.all(
+            rawMessages.map(async (message) => ({
+              ...message,
+              displayContent: await decryptTextForChat(message.encryptedContent, profileSecretId, secretKey),
+            }))
+          );
+
+          setMessages(decryptedMessages);
+          setNotice('Chat unlocked with pasted secret key.');
+          setError('');
+          return;
+        } catch {
+          setIsChatLocked(true);
+        }
+      }
+
+      await submitContactSecret(secretKey);
+    } catch (pasteError) {
+      setError(pasteError.message || 'Failed to paste secret key.');
     }
   };
 
@@ -584,7 +796,7 @@ function App() {
     if (!msgInput.trim() || !activeChat?.id || !token) return;
 
     if (!profileSecretId || !activeContactSecretId) {
-      setError('This chat is locked on this device. Add the contact Secret ID again to unlock it.');
+      setError('This chat is locked on this device. Add the contact Secret Key again to unlock it.');
       return;
     }
 
@@ -673,22 +885,25 @@ function App() {
             </button>
           </div>
           <div className="summary-row">
-            <span className="summary-label">My Secret ID</span>
+            <span className="summary-label">My Secret Key</span>
             <span className="summary-code">{profileSecretId || 'Generating...'}</span>
           </div>
         </div>
 
         <form className="panel" onSubmit={addContactBySecret}>
-          <h4>Add Contact By Secret ID</h4>
+          <h4>Add Contact By Secret Key</h4>
           <div className="add-row">
             <input
               type="text"
               value={contactSecretKey}
               onChange={(event) => setContactSecretKey(event.target.value)}
-              placeholder="Enter contact secret ID"
+              placeholder="Enter contact secret key"
               minLength={6}
               maxLength={64}
             />
+            <button type="button" className="secondary-btn" onClick={pasteContactSecret} title="Paste secret key">
+              Paste
+            </button>
             <button type="submit" disabled={isAddingContact} title="Add contact">
               {isAddingContact ? '...' : <Plus size={16} />}
             </button>
@@ -713,7 +928,21 @@ function App() {
               >
                 <div className="contact-head">
                   <span className="contact-name">{contact.username || fallbackName(contact.id, 'Contact')}</span>
-                  <span className="contact-time">{formatMessageTime(chat?.lastMessageTime)}</span>
+                  <div className="contact-actions">
+                    <span className="contact-time">{formatMessageTime(chat?.lastMessageTime)}</span>
+                    <button
+                      type="button"
+                      className="contact-delete-btn"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        deleteContact(contact.id);
+                      }}
+                      aria-label={`Delete ${contact.username || fallbackName(contact.id, 'Contact')}`}
+                      title="Delete contact"
+                    >
+                      ×
+                    </button>
+                  </div>
                 </div>
                 <div className="contact-preview">
                   {chat?.lastMessage
@@ -740,7 +969,14 @@ function App() {
             </div>
             {isChatLocked ? (
               <div className="locked-banner">
-                This chat is locked on this device. You must add this contact using their Secret ID here before messages can be decrypted.
+                <div className="locked-banner-text">
+                  This chat is locked on this device. You must add this contact using their Secret Key here before messages can be decrypted.
+                </div>
+                <div className="locked-banner-actions">
+                  <button type="button" className="secondary-btn lock-action" onClick={pasteContactSecret}>
+                    Paste Secret Key
+                  </button>
+                </div>
               </div>
             ) : null}
             <div className="messages">
@@ -757,7 +993,7 @@ function App() {
                 type="text"
                 value={msgInput}
                 onChange={(event) => setMsgInput(event.target.value)}
-                placeholder={isChatLocked ? 'Unlock this contact with Secret ID to chat' : 'Type a message...'}
+                placeholder={isChatLocked ? 'Unlock this contact with Secret Key to chat' : 'Type a message...'}
                 disabled={isChatLocked}
               />
               <button type="submit" disabled={!msgInput.trim() || isChatLocked} title="Send message">
@@ -766,7 +1002,7 @@ function App() {
             </form>
           </>
         ) : (
-          <div className="empty-state">Add a contact with secret ID and click it to load all previous chats.</div>
+          <div className="empty-state">Add a contact with secret key and click it to load all previous chats.</div>
         )}
       </main>
 
@@ -785,7 +1021,7 @@ function App() {
                 autoFocus
               />
               <div className="summary-row">
-                <span className="summary-label">Secret ID</span>
+                <span className="summary-label">Secret Key</span>
                 <span className="summary-code">{profileSecretId || 'Generating...'}</span>
               </div>
               <div className="modal-actions">
